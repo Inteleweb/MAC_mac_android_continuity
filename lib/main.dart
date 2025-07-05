@@ -3,7 +3,6 @@ import 'dart:io';
 
 import 'package:archive/archive_io.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:path/path.dart' as path;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -457,7 +456,7 @@ Future<String?> _extractIconFromApk(File apkFile, String package) async {
       return null;
     }
 
-    if (archive == null || archive.files.isEmpty) {
+    if (archive.files.isEmpty) {
       print('Empty or invalid archive for $package');
       return null;
     }
