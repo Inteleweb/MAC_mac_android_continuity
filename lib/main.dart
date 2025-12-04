@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive_io.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
@@ -274,6 +275,26 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
     }
   }
 
+  Future<String?> _getDeviceSerial(String device) async {
+    try {
+      final result = await Process.run(
+        adbPath,
+        ['-s', device, 'get-serialno'],
+        environment: _getEnvironment(),
+      );
+      if (result.exitCode == 0) {
+        final serial = result.stdout.toString().trim();
+        if (serial.isNotEmpty && serial != 'unknown') {
+          return serial;
+        }
+      }
+    } catch (e) {
+      print('Error getting device serial: $e');
+    }
+    // Fallback to the device identifier if serial is unavailable
+    return device;
+  }
+
   Future<void> fetchDevices() async {
     if (!prefsLoaded) return;
     setState(() {
@@ -322,8 +343,15 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
       error = null;
     });
 
-    // First, try to load from cache
-    final cachedApps = prefs.getCachedApps(device);
+    // Get the device's actual serial number for persistent caching
+    final deviceSerial = await _getDeviceSerial(device);
+    if (deviceSerial == null) {
+      setState(() => error = 'Could not get device serial number');
+      return;
+    }
+
+    // First, try to load from cache using device serial
+    final cachedApps = prefs.getCachedApps(deviceSerial);
     if (cachedApps.isNotEmpty) {
       setState(() {
         apps = cachedApps;
@@ -380,8 +408,8 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
         }
       }
 
-        // Cache the apps list
-      await prefs.setCachedApps(device, parsedApps);
+        // Cache the apps list using device serial
+      await prefs.setCachedApps(deviceSerial, parsedApps);
 
       setState(() {
         // Sort apps with favorites first
@@ -402,6 +430,23 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
   }
 
 Future<String?> _extractAppIcon(String device, String package) async {
+  try {
+    // Try Play Store first
+    final playStoreIcon = await _fetchIconFromPlayStore(package);
+    if (playStoreIcon != null) {
+      return playStoreIcon;
+    }
+    
+    // Fallback to APK extraction
+    print('Play Store fetch failed for $package, trying APK extraction...');
+    return await _extractIconFromApk(device, package);
+  } catch (e) {
+    print('Error fetching icon for $package: $e');
+    return null;
+  }
+}
+
+Future<String?> _fetchIconFromPlayStore(String package) async {
   try {
     // Fetch icon from Play Store
     final playStoreUrl = 'https://play.google.com/store/apps/details?id=$package';
@@ -478,6 +523,209 @@ Future<String?> _extractAppIcon(String device, String package) async {
   } catch (e) {
     print('Error fetching icon from Play Store for $package: $e');
     return null;
+  }
+}
+
+Future<String?> _extractIconFromApk(String device, String package) async {
+  try {
+    // Get APK path
+    final apkPathResult = await Process.run(
+      adbPath, 
+      ['-s', device, 'shell', 'pm', 'path', package],
+      environment: _getEnvironment(),
+    );
+    if (apkPathResult.exitCode != 0) return null;
+
+    final apkPathOutput = apkPathResult.stdout.toString().trim();
+    if (apkPathOutput.isEmpty) return null;
+
+    // Handle multiple package paths (some apps have split APKs)
+    final packageLines = apkPathOutput.split('\n')
+        .where((line) => line.startsWith('package:'))
+        .map((line) => line.substring(8).trim())
+        .where((path) => path.isNotEmpty)
+        .toList();
+
+    if (packageLines.isEmpty) return null;
+
+    // Try the main APK first (usually the first one)
+    final remoteApkPath = packageLines.first;
+    final localApkPath = path.join(tempDir, '${package}_${DateTime.now().millisecondsSinceEpoch}.apk');
+    
+    try {
+      // Pull APK with timeout
+      final pullResult = await Process.run(
+        adbPath, 
+        ['-s', device, 'pull', remoteApkPath, localApkPath],
+        environment: _getEnvironment(),
+      ).timeout(const Duration(seconds: 30));
+      
+      if (pullResult.exitCode != 0 || !File(localApkPath).existsSync()) {
+        return null;
+      }
+
+      // Check file size (avoid processing corrupted/empty files)
+      final apkFile = File(localApkPath);
+      final fileSize = await apkFile.length();
+      if (fileSize < 1024) { // APK too small, likely corrupted
+        await _cleanupFile(localApkPath);
+        return null;
+      }
+
+      // Extract icon with better error handling
+      final iconPath = await _extractIconFromApkFile(apkFile, package);
+      
+      // Clean up APK file
+      await _cleanupFile(localApkPath);
+      
+      return iconPath;
+      
+    } catch (e) {
+      print('Error processing APK for $package: $e');
+      await _cleanupFile(localApkPath);
+      return null;
+    }
+    
+  } catch (e) {
+    print('Error extracting icon from APK for $package: $e');
+    return null;
+  }
+}
+
+Future<String?> _extractIconFromApkFile(File apkFile, String package) async {
+  try {
+    final bytes = await apkFile.readAsBytes();
+    
+    // Validate ZIP file header
+    if (bytes.length < 4 || 
+        bytes[0] != 0x50 || bytes[1] != 0x4B || 
+        (bytes[2] != 0x03 && bytes[2] != 0x05 && bytes[2] != 0x07)) {
+      print('Invalid ZIP header for $package');
+      return null;
+    }
+
+    Archive? archive;
+    try {
+      archive = ZipDecoder().decodeBytes(bytes);
+    } catch (e) {
+      print('Failed to decode ZIP for $package: $e');
+      return null;
+    }
+
+    if (archive.files.isEmpty) {
+      print('Empty or invalid archive for $package');
+      return null;
+    }
+
+    ArchiveFile? iconEntry;
+    
+    // Try different icon paths in order of preference
+    final iconPaths = [
+      // High resolution first
+      'res/mipmap-xxxhdpi/ic_launcher.png',
+      'res/mipmap-xxhdpi/ic_launcher.png',
+      'res/mipmap-xhdpi/ic_launcher.png',
+      'res/mipmap-hdpi/ic_launcher.png',
+      'res/mipmap-mdpi/ic_launcher.png',
+      'res/mipmap-ldpi/ic_launcher.png',
+      // Drawable alternatives
+      'res/drawable-xxxhdpi/ic_launcher.png',
+      'res/drawable-xxhdpi/ic_launcher.png',
+      'res/drawable-xhdpi/ic_launcher.png',
+      'res/drawable-hdpi/ic_launcher.png',
+      'res/drawable-mdpi/ic_launcher.png',
+      'res/drawable/ic_launcher.png',
+    ];
+
+    // Try exact matches first
+    for (final iconPath in iconPaths) {
+      try {
+        iconEntry = archive.files.firstWhere(
+          (f) => f.name.toLowerCase() == iconPath.toLowerCase(),
+          orElse: () => throw StateError('Not found'),
+        );
+        if (iconEntry.isFile && iconEntry.size > 0) {
+          break;
+        }
+      } catch (_) {
+        iconEntry = null;
+      }
+    }
+
+    // Fallback: find any ic_launcher icon
+    if (iconEntry == null) {
+      try {
+        final candidates = archive.files.where((f) => 
+          f.name.toLowerCase().contains('ic_launcher') && 
+          f.name.toLowerCase().endsWith('.png') &&
+          f.isFile &&
+          f.size > 0
+        ).toList();
+        
+        if (candidates.isNotEmpty) {
+          // Prefer higher resolution (longer path names usually indicate higher res)
+          candidates.sort((a, b) => b.name.length.compareTo(a.name.length));
+          iconEntry = candidates.first;
+        }
+      } catch (e) {
+        print('Error finding fallback icon for $package: $e');
+      }
+    }
+
+    // Final fallback: any PNG icon
+    if (iconEntry == null) {
+      try {
+        final candidates = archive.files.where((f) => 
+          f.name.toLowerCase().endsWith('.png') &&
+          (f.name.toLowerCase().contains('icon') || f.name.toLowerCase().contains('launcher')) &&
+          f.isFile &&
+          f.size > 100 // At least 100 bytes for a valid icon
+        ).toList();
+        
+        if (candidates.isNotEmpty) {
+          iconEntry = candidates.first;
+        }
+      } catch (e) {
+        print('Error finding any icon for $package: $e');
+      }
+    }
+
+    if (iconEntry != null && iconEntry.isFile && iconEntry.size > 0) {
+      try {
+        final cachedIconPath = path.join(cacheDir, '$package.png');
+        final iconFile = File(cachedIconPath);
+        
+        // Ensure content is valid
+        final content = iconEntry.content;
+        if (content is List<int> && content.isNotEmpty) {
+          await iconFile.writeAsBytes(content);
+          
+          // Verify the written file
+          if (await iconFile.exists() && await iconFile.length() > 0) {
+            return cachedIconPath;
+          }
+        }
+      } catch (e) {
+        print('Error writing icon file for $package: $e');
+      }
+    }
+    
+    return null;
+    
+  } catch (e) {
+    print('Error in _extractIconFromApkFile for $package: $e');
+    return null;
+  }
+}
+
+Future<void> _cleanupFile(String filePath) async {
+  try {
+    final file = File(filePath);
+    if (await file.exists()) {
+      await file.delete();
+    }
+  } catch (e) {
+    print('Warning: Could not cleanup file $filePath: $e');
   }
 }
   Future<void> launchApp() async {
