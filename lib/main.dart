@@ -1,8 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:archive/archive_io.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -212,6 +212,24 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
     return '/opt/homebrew/bin/scrcpy';
   }
 
+  Map<String, String> _getEnvironment() {
+    final env = Map<String, String>.from(Platform.environment);
+    if (Platform.isMacOS) {
+      // Add Homebrew paths to PATH if not present
+      final currentPath = env['PATH'] ?? '';
+      final homebrewPaths = ['/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/local/bin'];
+      final pathParts = currentPath.split(':');
+      
+      for (final homebrewPath in homebrewPaths) {
+        if (!pathParts.contains(homebrewPath)) {
+          pathParts.insert(0, homebrewPath);
+        }
+      }
+      env['PATH'] = pathParts.join(':');
+    }
+    return env;
+  }
+
   String get tempDir {
     if (Platform.isWindows) {
       return Platform.environment['TEMP'] ?? r'C:\temp';
@@ -263,7 +281,11 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
       error = null;
     });
     try {
-      final result = await Process.run(adbPath, ['devices']);
+      final result = await Process.run(
+        adbPath, 
+        ['devices'],
+        environment: _getEnvironment(),
+      );
       if (result.exitCode != 0) {
         throw Exception('ADB command failed: \\${result.stderr}');
       }
@@ -313,7 +335,11 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
     try {
       setState(() => isLoading = true);
       
-      final result = await Process.run(scrcpyPath, ['--list-apps', '-s', device]);
+      final result = await Process.run(
+        scrcpyPath, 
+        ['--list-apps', '-s', device],
+        environment: _getEnvironment(),
+      );
       if (result.exitCode != 0) {
         throw Exception('scrcpy command failed: ${result.stderr}');
       }
@@ -377,199 +403,81 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
 
 Future<String?> _extractAppIcon(String device, String package) async {
   try {
-    // Get APK path
-    final apkPathResult = await Process.run(adbPath, ['-s', device, 'shell', 'pm', 'path', package]);
-    if (apkPathResult.exitCode != 0) return null;
+    // Fetch icon from Play Store
+    final playStoreUrl = 'https://play.google.com/store/apps/details?id=$package';
+    final response = await http.get(
+      Uri.parse(playStoreUrl),
+    ).timeout(const Duration(seconds: 10));
 
-    final apkPathOutput = apkPathResult.stdout.toString().trim();
-    if (apkPathOutput.isEmpty) return null;
-
-    // Handle multiple package paths (some apps have split APKs)
-    final packageLines = apkPathOutput.split('\n')
-        .where((line) => line.startsWith('package:'))
-        .map((line) => line.substring(8).trim())
-        .where((path) => path.isNotEmpty)
-        .toList();
-
-    if (packageLines.isEmpty) return null;
-
-    // Try the main APK first (usually the first one)
-    final remoteApkPath = packageLines.first;
-    final localApkPath = path.join(tempDir, '${package}_${DateTime.now().millisecondsSinceEpoch}.apk');
-    
-    try {
-      // Pull APK with timeout
-      final pullResult = await Process.run(
-        adbPath, 
-        ['-s', device, 'pull', remoteApkPath, localApkPath],
-      ).timeout(const Duration(seconds: 30));
-      
-      if (pullResult.exitCode != 0 || !File(localApkPath).existsSync()) {
-        return null;
-      }
-
-      // Check file size (avoid processing corrupted/empty files)
-      final apkFile = File(localApkPath);
-      final fileSize = await apkFile.length();
-      if (fileSize < 1024) { // APK too small, likely corrupted
-        await _cleanupFile(localApkPath);
-        return null;
-      }
-
-      // Extract icon with better error handling
-      final iconPath = await _extractIconFromApk(apkFile, package);
-      
-      // Clean up APK file
-      await _cleanupFile(localApkPath);
-      
-      return iconPath;
-      
-    } catch (e) {
-      print('Error processing APK for $package: $e');
-      await _cleanupFile(localApkPath);
+    if (response.statusCode != 200) {
+      print('Failed to fetch Play Store page for $package: ${response.statusCode}');
       return null;
     }
+
+    // Parse HTML to find icon URL
+    final html = response.body;
     
-  } catch (e) {
-    print('Error extracting icon for $package: $e');
+    // Look for the app icon in the HTML
+    // The Play Store uses various patterns, we'll try multiple approaches
+    String? iconUrl;
+    
+    // Pattern 1: Look for itemprop="image" content attribute
+    final itemPropPattern = RegExp(r'itemprop="image"[^>]*content="([^"]+)"');
+    final itemPropMatch = itemPropPattern.firstMatch(html);
+    if (itemPropMatch != null) {
+      iconUrl = itemPropMatch.group(1);
+    }
+    
+    // Pattern 2: Look for og:image meta tag
+    if (iconUrl == null) {
+      final ogImagePattern = RegExp(r'<meta[^>]*property="og:image"[^>]*content="([^"]+)"');
+      final ogImageMatch = ogImagePattern.firstMatch(html);
+      if (ogImageMatch != null) {
+        iconUrl = ogImageMatch.group(1);
+      }
+    }
+    
+    // Pattern 3: Look for twitter:image meta tag
+    if (iconUrl == null) {
+      final twitterImagePattern = RegExp(r'<meta[^>]*name="twitter:image"[^>]*content="([^"]+)"');
+      final twitterImageMatch = twitterImagePattern.firstMatch(html);
+      if (twitterImageMatch != null) {
+        iconUrl = twitterImageMatch.group(1);
+      }
+    }
+
+    if (iconUrl == null) {
+      print('Could not find icon URL in Play Store page for $package');
+      return null;
+    }
+
+    // Clean up the URL (remove size parameters to get highest quality)
+    iconUrl = iconUrl.split('=')[0];
+    
+    // Download the icon
+    final iconResponse = await http.get(
+      Uri.parse(iconUrl),
+    ).timeout(const Duration(seconds: 10));
+
+    if (iconResponse.statusCode != 200) {
+      print('Failed to download icon for $package: ${iconResponse.statusCode}');
+      return null;
+    }
+
+    // Save to cache
+    final cachedIconPath = path.join(cacheDir, '$package.png');
+    final iconFile = File(cachedIconPath);
+    await iconFile.writeAsBytes(iconResponse.bodyBytes);
+
+    // Verify the written file
+    if (await iconFile.exists() && await iconFile.length() > 0) {
+      return cachedIconPath;
+    }
+
     return null;
-  }
-}
-
-Future<String?> _extractIconFromApk(File apkFile, String package) async {
-  try {
-    final bytes = await apkFile.readAsBytes();
-    
-    // Validate ZIP file header
-    if (bytes.length < 4 || 
-        bytes[0] != 0x50 || bytes[1] != 0x4B || 
-        (bytes[2] != 0x03 && bytes[2] != 0x05 && bytes[2] != 0x07)) {
-      print('Invalid ZIP header for $package');
-      return null;
-    }
-
-    Archive? archive;
-    try {
-      archive = ZipDecoder().decodeBytes(bytes);
-    } catch (e) {
-      print('Failed to decode ZIP for $package: $e');
-      return null;
-    }
-
-    if (archive.files.isEmpty) {
-      print('Empty or invalid archive for $package');
-      return null;
-    }
-
-    ArchiveFile? iconEntry;
-    
-    // Try different icon paths in order of preference
-    final iconPaths = [
-      // High resolution first
-      'res/mipmap-xxxhdpi/ic_launcher.png',
-      'res/mipmap-xxhdpi/ic_launcher.png',
-      'res/mipmap-xhdpi/ic_launcher.png',
-      'res/mipmap-hdpi/ic_launcher.png',
-      'res/mipmap-mdpi/ic_launcher.png',
-      'res/mipmap-ldpi/ic_launcher.png',
-      // Drawable alternatives
-      'res/drawable-xxxhdpi/ic_launcher.png',
-      'res/drawable-xxhdpi/ic_launcher.png',
-      'res/drawable-xhdpi/ic_launcher.png',
-      'res/drawable-hdpi/ic_launcher.png',
-      'res/drawable-mdpi/ic_launcher.png',
-      'res/drawable/ic_launcher.png',
-    ];
-
-    // Try exact matches first
-    for (final iconPath in iconPaths) {
-      try {
-        iconEntry = archive.files.firstWhere(
-          (f) => f.name.toLowerCase() == iconPath.toLowerCase(),
-          orElse: () => throw StateError('Not found'),
-        );
-        if (iconEntry.isFile && iconEntry.size > 0) {
-          break;
-        }
-      } catch (_) {
-        iconEntry = null;
-      }
-    }
-
-    // Fallback: find any ic_launcher icon
-    if (iconEntry == null) {
-      try {
-        final candidates = archive.files.where((f) => 
-          f.name.toLowerCase().contains('ic_launcher') && 
-          f.name.toLowerCase().endsWith('.png') &&
-          f.isFile &&
-          f.size > 0
-        ).toList();
-        
-        if (candidates.isNotEmpty) {
-          // Prefer higher resolution (longer path names usually indicate higher res)
-          candidates.sort((a, b) => b.name.length.compareTo(a.name.length));
-          iconEntry = candidates.first;
-        }
-      } catch (e) {
-        print('Error finding fallback icon for $package: $e');
-      }
-    }
-
-    // Final fallback: any PNG icon
-    if (iconEntry == null) {
-      try {
-        final candidates = archive.files.where((f) => 
-          f.name.toLowerCase().endsWith('.png') &&
-          (f.name.toLowerCase().contains('icon') || f.name.toLowerCase().contains('launcher')) &&
-          f.isFile &&
-          f.size > 100 // At least 100 bytes for a valid icon
-        ).toList();
-        
-        if (candidates.isNotEmpty) {
-          iconEntry = candidates.first;
-        }
-      } catch (e) {
-        print('Error finding any icon for $package: $e');
-      }
-    }
-
-    if (iconEntry != null && iconEntry.isFile && iconEntry.size > 0) {
-      try {
-        final cachedIconPath = path.join(cacheDir, '$package.png');
-        final iconFile = File(cachedIconPath);
-        
-        // Ensure content is valid
-        final content = iconEntry.content;
-        if (content is List<int> && content.isNotEmpty) {
-          await iconFile.writeAsBytes(content);
-          
-          // Verify the written file
-          if (await iconFile.exists() && await iconFile.length() > 0) {
-            return cachedIconPath;
-          }
-        }
-      } catch (e) {
-        print('Error writing icon file for $package: $e');
-      }
-    }
-    
-    return null;
-    
   } catch (e) {
-    print('Error in _extractIconFromApk for $package: $e');
+    print('Error fetching icon from Play Store for $package: $e');
     return null;
-  }
-}
-
-Future<void> _cleanupFile(String filePath) async {
-  try {
-    final file = File(filePath);
-    if (await file.exists()) {
-      await file.delete();
-    }
-  } catch (e) {
-    print('Warning: Could not cleanup file $filePath: $e');
   }
 }
   Future<void> launchApp() async {
@@ -601,7 +509,11 @@ Future<void> _cleanupFile(String filePath) async {
     }
 
     try {
-      final process = await Process.start(scrcpyPath, args);
+      final process = await Process.start(
+        scrcpyPath, 
+        args,
+        environment: _getEnvironment(),
+      );
       
       print('Launched scrcpy with PID: ${process.pid}');
       print('Command: $scrcpyPath ${args.join(' ')}');
@@ -726,7 +638,11 @@ Future<void> _cleanupFile(String filePath) async {
       args.add('--no-vd-destroy-content');
     }
     try {
-      final process = await Process.start(scrcpyPath, args);
+      final process = await Process.start(
+        scrcpyPath, 
+        args,
+        environment: _getEnvironment(),
+      );
       print('Launched scrcpy with PID: \\${process.pid}');
       print('Command: $scrcpyPath \\${args.join(' ')}');
       if (mounted) {
