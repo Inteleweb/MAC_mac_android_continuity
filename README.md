@@ -1,67 +1,102 @@
-# android_launcher
+# Android Launcher
 
-A new Flutter project.
+A cross-platform desktop application that enables seamless Android device integration with your computer. This project recreates Microsoft's Phone Link functionality without manufacturer restrictions (Samsung) or OS limitations.
 
-## Getting Started
+## Features
 
-This project is a starting point for a Flutter application.
+- 🚀 Launch individual Android apps in separate windows on your desktop
+- 📱 Stream apps without requiring any companion app on your phone
+- 💻 Cross-platform support: Windows, macOS, Linux, and ChromeOS
+- 🔌 Works with any Android device via USB or wireless connection
+- 🎯 Built with Flutter for a native desktop experience
+- ⚡ Powered by [scrcpy](https://github.com/Genymobile/scrcpy) for high-performance screen mirroring
 
-A few resources to get you started if this is your first Flutter project:
+## Requirements
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+- Android device with USB debugging enabled
+- ADB (Android Debug Bridge) installed
+- scrcpy installed on your system
+- For macOS: macOS 10.15 or later
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Installation
 
-# macOS_android_continuity
+### macOS
 
-```scrcpy --no-audio -Sw -s {{device_ip}} --new-display=1080x2340 --start-app=+{{app_id} --no-vd-system-decorations --no-vd-destroy-content```
+1. Download the latest release from the [Releases](https://github.com/Inteleweb/MAC_mac_android_continuity/releases) page
+2. Extract `android_launcher-macos.zip`
+3. Move the app to your Applications folder
+4. Install scrcpy if not already installed:
+   ```bash
+   brew install scrcpy
+   ```
 
-# Android_Continuity
+### Windows
 
-A project to recreate Microsoft's Phone link but not limited to device manufacturer (Samsung) or desktop OS with support for
-- Windows
-- MacOS
-- Linux
-- ChromeOS
+1. Download and install scrcpy from [releases](https://github.com/Genymobile/scrcpy/releases)
+2. Download the Windows build from releases
+3. Extract and run the application
 
-It's based on SCRCPY and requires no app on the phone at all
+## Usage
 
-## The command
+### Enabling USB Debugging on Android
+
+1. Go to **Settings** → **About phone**
+2. Tap **Build number** 7 times to enable Developer options
+3. Go to **Settings** → **Developer options**
+4. Enable **USB debugging**
+
+### Connecting Your Device
+
+#### USB Connection
+```bash
+adb devices
+```
+
+#### Wireless Connection
+```bash
+adb connect <device_ip>:5555
+```
+
+To disconnect:
+```bash
+adb disconnect
+```
+
+## How It Works
+
+The application uses scrcpy (pronounced "screen copy") to create virtual displays on your Android device and stream individual apps to separate windows on your desktop.
+
+### Basic Command Structure
 
 ```bash
-scrcpy --no-audio -d --new-display=1080x2340 --start-app=com.whatsapp.w4b --no-vd-system-decorations --no-vd-destroy-content
+scrcpy --no-audio -d --new-display=1080x2340 --start-app=com.example.app --no-vd-system-decorations --no-vd-destroy-content
 ```
 
-### scrcpy
-(Pronounced screen copy) is a wrapper based on ADB but well documented
+### Command Parameters Explained
 
-### --no-audio
-keeps audio playing on the phone itself. you can remove it to stream music to the PC but is not supported by this project
+- `--no-audio` - Keeps audio playing on the phone (remove to stream audio to desktop)
+- `-d` - Use USB-connected device
+- `-e` - Use wireless-connected device  
+- `-s <device_id>` - Specify a particular device when multiple are connected
+- `--new-display=1080x2340` - Creates a virtual display with specified resolution (Samsung S24 ratio)
+- `--start-app=<package_id>` - Launches the specified Android app
+- `--no-vd-system-decorations` - Removes system UI decorations from virtual display
+- `--no-vd-destroy-content` - Preserves content when disconnecting
 
-### -d
-or
-### -s 
-specifies the remote device in case multiple are connected.
-- -d = USB
-- -e = Wireless
-- -s specific device
+### Platform-Specific Examples
 
-you can view the connected devices by using ```adb devices```
+#### macOS
+```bash
+scrcpy --no-audio -Sw -s <device_ip> --new-display=1080x2340 --start-app=com.whatsapp.w4b --no-vd-system-decorations --no-vd-destroy-content
+```
 
-### --new-display=1080x2340
-This is what we use to stream individual apps the display ratio is that of a Samsung S24
-
-# Notes
-
-## Windows 
-
+#### Windows
 ```powershell
-C:\Users\YechielWeisfish\Downloads\scrcpy-win64-v3.2\scrcpy-win64-v3.2\scrcpy --no-audio --new-display=960x1080 --start-app=+com.whatsapp.w4b
+scrcpy --no-audio --new-display=960x1080 --start-app=com.whatsapp.w4b
 ```
-## Apps
+## Supported Apps
+
+You can launch any Android app using its package ID. Here are common apps and their package IDs:
 | App Name                           | App ID                                      |
 |-------------------------------------|---------------------------------------------|
 | Accessibility                      | `com.samsung.accessibility`                 |
@@ -96,13 +131,57 @@ C:\Users\YechielWeisfish\Downloads\scrcpy-win64-v3.2\scrcpy-win64-v3.2\scrcpy --
 | Smart Switch                       | `com.sec.android.easyMover`                 |
 | System Tracing                     | `com.android.traceur`                       | |
 
-## Android  Auto
-To use Android Auto, you can use the following command:
+## Development
+
+### Building from Source
 
 ```bash
-```
-## Random Notes
+# Clone the repository
+git clone https://github.com/Inteleweb/MAC_mac_android_continuity.git
+cd MAC_mac_android_continuity
 
-adb disconnect
-adb devices
-adb connect
+# Install dependencies
+flutter pub get
+
+# Run the app
+flutter run -d macos
+
+# Build for release
+flutter build macos --release
+```
+
+### Project Structure
+
+This is a Flutter desktop application that interfaces with scrcpy to provide a user-friendly way to launch and manage Android apps on your desktop.
+
+## Troubleshooting
+
+### Device Not Detected
+
+1. Ensure USB debugging is enabled on your Android device
+2. Check device connection: `adb devices`
+3. Try reconnecting: `adb disconnect && adb connect <device_ip>`
+
+### App Won't Launch
+
+- Verify the app package ID is correct
+- Ensure the app is installed on your device
+- Check that scrcpy is properly installed and in your PATH
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is open source and available under the MIT License.
+
+## Acknowledgments
+
+- Built with [Flutter](https://flutter.dev/)
+- Powered by [scrcpy](https://github.com/Genymobile/scrcpy)
+- Inspired by Microsoft's Phone Link
+
+## Support
+
+For issues and feature requests, please use the [GitHub Issues](https://github.com/Inteleweb/MAC_mac_android_continuity/issues) page.

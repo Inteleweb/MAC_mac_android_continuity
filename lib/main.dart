@@ -19,7 +19,15 @@ class AndroidLauncherApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Android Launcher',
-      theme: ThemeData(useMaterial3: true),
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.light,
+      ),
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+      ),
+      themeMode: ThemeMode.system,
       home: const LauncherHomePage(),
     );
   }
@@ -295,6 +303,179 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
     return device;
   }
 
+  Future<String?> _getGatewayIp() async {
+    try {
+      if (Platform.isMacOS || Platform.isLinux) {
+        // Get the default route gateway IP
+        final result = await Process.run(
+          'netstat',
+          ['-nr'],
+          environment: _getEnvironment(),
+        );
+        if (result.exitCode == 0) {
+          final lines = LineSplitter.split(result.stdout.toString());
+          for (final line in lines) {
+            // Look for default route
+            if (line.contains('default') || line.startsWith('0.0.0.0')) {
+              final parts = line.split(RegExp(r'\s+'));
+              // Gateway IP is typically the second column
+              if (parts.length > 1) {
+                final gateway = parts[1];
+                // Validate IP format
+                if (RegExp(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$').hasMatch(gateway)) {
+                  return gateway;
+                }
+              }
+            }
+          }
+        }
+      } else if (Platform.isWindows) {
+        // Windows: use route print
+        final result = await Process.run(
+          'route',
+          ['print', '0.0.0.0'],
+          environment: _getEnvironment(),
+        );
+        if (result.exitCode == 0) {
+          final lines = LineSplitter.split(result.stdout.toString());
+          for (final line in lines) {
+            if (line.contains('0.0.0.0') && line.contains('0.0.0.0')) {
+              final parts = line.split(RegExp(r'\s+'));
+              if (parts.length > 2) {
+                final gateway = parts[2];
+                if (RegExp(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$').hasMatch(gateway)) {
+                  return gateway;
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      print('Error getting gateway IP: $e');
+    }
+    return null;
+  }
+
+  Future<void> connectToHotspot() async {
+    setState(() {
+      isLoading = true;
+      error = null;
+    });
+
+    try {
+      // Get gateway IP
+      final gatewayIp = await _getGatewayIp();
+      if (gatewayIp == null) {
+        throw Exception('Could not determine gateway IP address');
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Connecting to $gatewayIp:5555...'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+
+      // Connect via ADB
+      final result = await Process.run(
+        adbPath,
+        ['connect', '$gatewayIp:5555'],
+        environment: _getEnvironment(),
+      );
+
+      if (result.exitCode != 0) {
+        throw Exception('ADB connect failed: ${result.stderr}');
+      }
+
+      final output = result.stdout.toString();
+      if (output.contains('connected') || output.contains('already connected')) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Connected to $gatewayIp:5555'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+        // Refresh devices list
+        await fetchDevices();
+      } else {
+        throw Exception('Connection failed: $output');
+      }
+    } catch (e) {
+      setState(() => error = 'Hotspot connection error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to connect: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      setState(() => isLoading = false);
+    }
+  }
+
+  Future<void> removeDeviceFromHistory(String device) async {
+    setState(() {
+      isLoading = true;
+    });
+
+    try {
+      // Always try to disconnect from ADB first
+      final disconnectResult = await Process.run(
+        adbPath,
+        ['disconnect', device],
+        environment: _getEnvironment(),
+      );
+      
+      print('ADB disconnect result for $device: ${disconnectResult.stdout}');
+
+      // Remove from device history
+      final history = prefs.deviceHistory;
+      history.remove(device);
+      prefs.deviceHistory = history;
+
+      // If this was the selected device, clear selection
+      if (selectedDevice == device) {
+        setState(() {
+          selectedDevice = null;
+          apps = [];
+        });
+      }
+
+      // Refresh the device list
+      await fetchDevices();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Disconnected and removed $device'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+    } catch (e) {
+      print('Error removing device $device: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      setState(() {
+        isLoading = false;
+      });
+    }
+  }
+
   Future<void> fetchDevices() async {
     if (!prefsLoaded) return;
     setState(() {
@@ -313,9 +494,16 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
       final lines = LineSplitter.split(result.stdout.toString()).toList();
       final foundDevices = lines
           .skip(1)
-          .where((line) => line.contains('device'))
-          .map((line) => line.split('\t').first)
+          .where((line) {
+            // Must have a tab separator and end with 'device' (not 'offline', 'unauthorized', etc.)
+            final parts = line.split('\t');
+            return parts.length >= 2 && parts[1].trim() == 'device';
+          })
+          .map((line) => line.split('\t').first.trim())
+          .where((device) => device.isNotEmpty)
           .toList();
+      
+      print('ADB devices found: $foundDevices');
       // Update device history
       for (final d in foundDevices) {
         prefs.addDeviceToHistory(d);
@@ -327,6 +515,7 @@ class _LauncherHomePageState extends State<LauncherHomePage> {
             ? prefs.lastDevice
             : (foundDevices.isNotEmpty ? foundDevices.first : null);
       });
+      print('State updated - devices: $devices, deviceHistory: $deviceHistory');
       if (selectedDevice != null) {
         prefs.lastDevice = selectedDevice;
         await fetchApps(selectedDevice!);
@@ -984,12 +1173,24 @@ Future<void> _cleanupFile(String filePath) async {
                                     size: 16,
                                   ),
                                   const SizedBox(width: 4),
-                                  Text(d, style: const TextStyle(fontSize: 12)),
+                                  Expanded(
+                                    child: Text(d, style: const TextStyle(fontSize: 12)),
+                                  ),
                                   if (!isReachable)
                                     const Padding(
-                                      padding: EdgeInsets.only(left: 4),
+                                      padding: EdgeInsets.only(left: 4, right: 4),
                                       child: Text('(offline)', style: TextStyle(fontSize: 10, color: Colors.red)),
                                     ),
+                                  IconButton(
+                                    icon: const Icon(Icons.close, size: 16),
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(),
+                                    onPressed: () {
+                                      removeDeviceFromHistory(d);
+                                    },
+                                    tooltip: 'Remove from list',
+                                    color: Colors.red.shade400,
+                                  ),
                                 ],
                               ),
                             );
@@ -1002,6 +1203,16 @@ Future<void> _cleanupFile(String filePath) async {
                             }
                           },
                         ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton.icon(
+                  onPressed: isLoading ? null : connectToHotspot,
+                  icon: const Icon(Icons.wifi, size: 16),
+                  label: const Text('Connect to Hotspot', style: TextStyle(fontSize: 12)),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    minimumSize: Size.zero,
+                  ),
                 ),
                 if (isLoading) const SizedBox(width: 8, child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))),
               ],
